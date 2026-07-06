@@ -1,0 +1,79 @@
+name: "nginx-custom-openssl"
+arch: "${PKG_ARCH}"
+platform: "linux"
+version: "${NGINX_VERSION}"
+release: "1.openssl${OPENSSL_VERSION}"
+section: "httpd"
+priority: "optional"
+maintainer: "DevOps <devops@example.com>"
+vendor: "Internal Build"
+homepage: "https://nginx.org"
+license: "BSD-2-Clause"
+description: |
+  Nginx ${NGINX_VERSION}, собранный со статически слинкованным OpenSSL ${OPENSSL_VERSION}.
+  Поддержка HTTP/2, HTTP/3 (QUIC) и stream-модуля.
+
+contents:
+  - src: ./pkgroot/usr/sbin/nginx
+    dst: /usr/sbin/nginx
+    file_info:
+      mode: 0755
+
+  - src: ./pkgroot/etc/nginx/mime.types
+    dst: /etc/nginx/mime.types
+
+  - src: ./pkgroot/etc/nginx/fastcgi_params
+    dst: /etc/nginx/fastcgi_params
+
+  - src: ./pkgroot/etc/nginx/uwsgi_params
+    dst: /etc/nginx/uwsgi_params
+
+  - src: ./pkgroot/etc/nginx/scgi_params
+    dst: /etc/nginx/scgi_params
+
+  - src: ./packaging/nginx.conf
+    dst: /etc/nginx/nginx.conf
+    type: config|noreplace
+
+  - src: ./packaging/nginx.service
+    dst: /lib/systemd/system/nginx.service
+
+  - dst: /etc/nginx/conf.d
+    type: dir
+
+  - dst: /var/log/nginx
+    type: dir
+    file_info:
+      mode: 0750
+      owner: nginx
+      group: nginx
+
+  - dst: /var/cache/nginx
+    type: dir
+    file_info:
+      mode: 0750
+      owner: nginx
+      group: nginx
+
+  - dst: /usr/share/nginx/html
+    type: dir
+
+scripts:
+  preinstall: ./packaging/scripts/preinstall.sh
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove: ./packaging/scripts/preremove.sh
+
+overrides:
+  deb:
+    depends:
+      - libpcre3
+      - zlib1g
+    conflicts:
+      - nginx
+      - nginx-core
+  rpm:
+    depends:
+      - pcre
+      - zlib
+    conflicts:
+      - nginx
