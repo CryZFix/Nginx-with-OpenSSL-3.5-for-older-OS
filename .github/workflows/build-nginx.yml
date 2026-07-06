@@ -1,0 +1,273 @@
+name: Build Nginx with custom OpenSSL
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  PKG_ARCH: amd64
+  NGINX_VERSIONS: "1.28.3,1.30.3"
+  OPENSSL_VERSION: "3.5.7"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 0. Готовим матрицу версий Nginx (из env.NGINX_VERSIONS)
+  # ---------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      nginx_versions: ${{ steps.set.outputs.versions }}
+    steps:
+      - id: set
+        run: |
+          JSON=$(python3 -c "import json,sys; print(json.dumps([v.strip() for v in sys.argv[1].split(',')]))" "$NGINX_VERSIONS")
+          echo "versions=$JSON" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # 1. Сборка OpenSSL (статически, no-shared) — отдельно под каждую цель
+  # ---------------------------------------------------------------------
+  build-openssl:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    container:
+      image: ${{ matrix.target.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { id: debian11, image: "debian:11", pkg_install: apt }
+          - { id: rockylinux8, image: "rockylinux:8", pkg_install: dnf }
+    steps:
+      - name: Установка зависимостей (Debian)
+        if: matrix.target.pkg_install == 'apt'
+        run: |
+          apt-get update
+          apt-get install -y build-essential perl curl ca-certificates
+
+      - name: Установка зависимостей (Rocky Linux)
+        if: matrix.target.pkg_install == 'dnf'
+        run: |
+          dnf install -y gcc make perl-interpreter perl-IPC-Cmd ca-certificates tar gzip diffutils
+
+      - name: Скачивание исходников OpenSSL
+        run: |
+          curl -fsSL -o openssl.tar.gz \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar xzf openssl.tar.gz
+
+      - name: Конфигурация и сборка OpenSSL
+        working-directory: openssl-${{ env.OPENSSL_VERSION }}
+        run: |
+          ./Configure linux-x86_64 \
+            no-shared \
+            no-tests \
+            --prefix=/opt/openssl \
+            --openssldir=/opt/openssl/ssl \
+            --libdir=lib
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Проверка сборки
+        run: /opt/openssl/bin/openssl version -a
+
+      - name: Упаковка артефакта
+        run: tar czf openssl-build.tar.gz -C /opt openssl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openssl-build-${{ matrix.target.id }}
+          path: openssl-build.tar.gz
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # 2. Сборка Nginx: nginx_version x target (двойная матрица)
+  # ---------------------------------------------------------------------
+  build-nginx:
+    needs: [prepare, build-openssl]
+    runs-on: ubuntu-22.04
+    container:
+      image: ${{ matrix.target.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx_version: ${{ fromJson(needs.prepare.outputs.nginx_versions) }}
+        target:
+          - { id: debian11, image: "debian:11", pkg_install: apt }
+          - { id: rockylinux8, image: "rockylinux:8", pkg_install: dnf }
+    steps:
+      - name: Установка зависимостей (Debian)
+        if: matrix.target.pkg_install == 'apt'
+        run: |
+          apt-get update
+          apt-get install -y build-essential libpcre3-dev zlib1g-dev curl ca-certificates binutils
+
+      - name: Установка зависимостей (Rocky Linux)
+        if: matrix.target.pkg_install == 'dnf'
+        run: |
+          dnf install -y gcc make pcre-devel zlib-devel ca-certificates binutils tar gzip
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: openssl-build-${{ matrix.target.id }}
+
+      - name: Распаковка OpenSSL
+        run: tar xzf openssl-build.tar.gz -C /tmp
+
+      - name: Скачивание исходников Nginx
+        run: |
+          curl -fsSL -o nginx.tar.gz "https://nginx.org/download/nginx-${{ matrix.nginx_version }}.tar.gz"
+          tar xzf nginx.tar.gz
+
+      - name: Конфигурация и сборка Nginx
+        working-directory: nginx-${{ matrix.nginx_version }}
+        run: |
+          ./configure \
+            --prefix=/usr/share/nginx \
+            --sbin-path=/usr/sbin/nginx \
+            --modules-path=/usr/lib/nginx/modules \
+            --conf-path=/etc/nginx/nginx.conf \
+            --error-log-path=/var/log/nginx/error.log \
+            --http-log-path=/var/log/nginx/access.log \
+            --pid-path=/run/nginx.pid \
+            --lock-path=/run/nginx.lock \
+            --user=nginx \
+            --group=nginx \
+            --with-http_ssl_module \
+            --with-http_v2_module \
+            --with-http_v3_module \
+            --with-http_realip_module \
+            --with-http_gzip_static_module \
+            --with-stream \
+            --with-stream_ssl_module \
+            --with-cc-opt="-I/tmp/openssl/include" \
+            --with-ld-opt="-L/tmp/openssl/lib -Wl,-Bstatic -lssl -lcrypto -Wl,-Bdynamic"
+          make -j"$(nproc)"
+          make install DESTDIR="$GITHUB_WORKSPACE/pkgroot"
+
+      - name: Проверка что libssl/libcrypto слинкованы статически
+        run: |
+          echo "Версия и модули:"
+          "$GITHUB_WORKSPACE/pkgroot/usr/sbin/nginx" -V
+          echo "Проверка динамических зависимостей:"
+          ldd "$GITHUB_WORKSPACE/pkgroot/usr/sbin/nginx" | grep -Ei 'ssl|crypto' && \
+            (echo "::error::libssl/libcrypto подключены динамически!" && exit 1) || \
+            echo "OK: OpenSSL слинкован статически"
+
+      - name: Проверка минимальной требуемой версии GLIBC
+        run: |
+          echo "Цель: ${{ matrix.target.id }}. Максимальная версия GLIBC, требуемая бинарником:"
+          objdump -T "$GITHUB_WORKSPACE/pkgroot/usr/sbin/nginx" \
+            | grep -oP 'GLIBC_[0-9.]+' | sort -V | uniq | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nginx-${{ matrix.nginx_version }}-${{ matrix.target.id }}-build
+          path: pkgroot
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # 3. Упаковка: deb — из debian11-сборки, rpm — из rockylinux8-сборки
+  # ---------------------------------------------------------------------
+  package:
+    needs: [prepare, build-nginx]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx_version: ${{ fromJson(needs.prepare.outputs.nginx_versions) }}
+        target:
+          - { id: debian11, packager: deb, release_tag: deb11 }
+          - { id: rockylinux8, packager: rpm, release_tag: el8 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nginx-${{ matrix.nginx_version }}-${{ matrix.target.id }}-build
+          path: pkgroot
+
+      - name: Установка nfpm
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt update
+          sudo apt install nfpm
+
+      - name: Установка gettext (envsubst)
+        run: sudo apt-get update && sudo apt-get install -y gettext-base
+
+      - name: Права на исполняемые файлы
+        run: |
+          chmod +x pkgroot/usr/sbin/nginx
+          chmod +x packaging/scripts/*.sh
+
+      - name: Генерация nfpm.yaml
+        env:
+          NGINX_VERSION: ${{ matrix.nginx_version }}
+          OPENSSL_VERSION: ${{ env.OPENSSL_VERSION }}
+          PKG_ARCH: ${{ env.PKG_ARCH }}
+          RELEASE_TAG: ${{ matrix.target.release_tag }}
+        run: envsubst < packaging/nfpm.yaml.tmpl > nfpm.yaml
+
+      - name: Сборка пакета (${{ matrix.target.packager }})
+        run: nfpm package --config nfpm.yaml --packager ${{ matrix.target.packager }} --target .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nginx-${{ matrix.nginx_version }}-${{ matrix.target.id }}-packages
+          path: |
+            *.deb
+            *.rpm
+          retention-days: 30
+
+  # ---------------------------------------------------------------------
+  # 4. Публикация пакетов в GitHub Release
+  #    Релиз создаётся при пуше тега v* или при ручном запуске
+  # ---------------------------------------------------------------------
+  release:
+    needs: [prepare, package]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nginx-*-packages
+          path: dist
+          merge-multiple: true
+
+      - name: Список пакетов для релиза
+        run: ls -lh dist
+
+      - name: Определение имени тега
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=manual-build-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Публикация релиза
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Nginx (OpenSSL ${{ env.OPENSSL_VERSION }}) — ${{ steps.tag.outputs.tag }}"
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            Пакеты Nginx, собранные со статически слинкованным OpenSSL ${{ env.OPENSSL_VERSION }}.
+
+            Версии Nginx в этом релизе: ${{ join(fromJson(needs.prepare.outputs.nginx_versions), ', ') }}
+
+            Поддерживаемые системы:
+            - `.deb` (собран на Debian 11) — Debian 11+, Ubuntu 20.04+
+            - `.rpm` (собран на Rocky Linux 8) — RHEL/Rocky/Alma 8 и 9+
+          files: |
+            dist/*.deb
+            dist/*.rpm
