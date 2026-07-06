@@ -52,7 +52,7 @@ jobs:
       - name: Установка зависимостей (Rocky Linux)
         if: matrix.target.pkg_install == 'dnf'
         run: |
-          dnf install -y gcc make perl-interpreter perl-IPC-Cmd ca-certificates tar gzip diffutils
+          dnf install -y gcc make perl-interpreter perl-IPC-Cmd perl-Time-Piece perl-Test-Simple perl-Text-Template ca-certificates tar gzip diffutils
 
       - name: Скачивание исходников OpenSSL
         run: |
